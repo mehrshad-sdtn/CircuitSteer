@@ -178,7 +178,12 @@ def main() -> None:
                 benign = [
                     text_of(item) for item in dataset["train_benign"]
                 ]
-                test_items = dataset["test_prompts"]
+                # Sweeping hyperparameters and reading delta off the
+                # test split would tune on it; use validation.
+                test_items = (
+                    dataset.get("val_prompts")
+                    or dataset["test_prompts"]
+                )
                 evaluation_cache = {}
 
                 def run_setting(parameter: str, value: float):

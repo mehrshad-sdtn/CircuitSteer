@@ -7,7 +7,10 @@ from circuitsteer.data import _split, make_datasets, text_of
 class DatasetUtilityTests(unittest.TestCase):
     def test_text_of_supports_strings_and_sycophancy_tuples(self):
         self.assertEqual(text_of("plain prompt"), "plain prompt")
-        self.assertEqual(text_of(("question", " (A)")), "question")
+        self.assertEqual(
+            text_of(("question", " (A)", " (B)")),
+            "question",
+        )
 
     def test_split_is_seeded_and_keeps_pairs_aligned(self):
         toxic = [f"toxic-{index}" for index in range(10)]
@@ -17,7 +20,10 @@ class DatasetUtilityTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(len(first["train_toxic"]), 8)
-        self.assertEqual(len(first["test_prompts"]), 2)
+        # The held-out 20% is halved into selection and reporting splits.
+        self.assertEqual(len(first["val_prompts"]), 1)
+        self.assertEqual(len(first["test_prompts"]), 1)
+        self.assertEqual(len(first["test_benign"]), 1)
         for toxic_item, benign_item in zip(
             first["train_toxic"],
             first["train_benign"],
@@ -27,11 +33,27 @@ class DatasetUtilityTests(unittest.TestCase):
                 benign_item.rsplit("-", 1)[1],
             )
 
+    def test_split_never_reuses_a_prompt_across_splits(self):
+        toxic = [f"toxic-{index}" for index in range(100)]
+        benign = [f"benign-{index}" for index in range(100)]
+        split = _split(toxic, benign, fraction=0.8, seed=42)
+
+        train = set(split["train_toxic"])
+        val = set(split["val_prompts"])
+        test = set(split["test_prompts"])
+        self.assertEqual(len(train & val), 0)
+        self.assertEqual(len(train & test), 0)
+        # Selecting the coefficient on val must not touch the test prompts.
+        self.assertEqual(len(val & test), 0)
+        self.assertEqual(len(train) + len(val) + len(test), 100)
+
     def test_make_datasets_loads_only_requested_tasks(self):
         fake_split = {
             "train_toxic": ["t"],
             "train_benign": ["b"],
+            "val_prompts": ["v"],
             "test_prompts": ["x"],
+            "test_benign": ["c"],
         }
         fake_loader = unittest.mock.Mock(return_value=fake_split)
         with patch.dict(

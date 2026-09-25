@@ -27,7 +27,9 @@ FIELDS = [
     "coeff",
     "delta",
     "delta_std",
+    "delta_sem",
     "norm_ppl",
+    "degenerate_frac",
     "n",
 ]
 
@@ -260,7 +262,11 @@ def main() -> None:
                     )
                 )
             base_scores = np.asarray([item[0] for item in base])
-            mean_base_ppl = float(np.mean([item[1] for item in base]))
+            # Empty generations score NaN rather than 0.0, so every
+            # aggregate here has to be nan-aware.
+            mean_base_ppl = float(
+                np.nanmean([item[1] for item in base])
+            )
 
             for method, vectors in (
                 ("CircuitSteer", circuit_vectors),
@@ -273,6 +279,7 @@ def main() -> None:
                     selected_layers = order[:k]
                     steered_scores = []
                     steered_perplexities = []
+                    n_degenerate = 0
                     for index, prompt in enumerate(test_prompts):
                         steerer.model.reset_hooks()
                         output = generate_restricted(
@@ -283,6 +290,8 @@ def main() -> None:
                             args.best_lambda,
                             args.seed + index,
                         )
+                        if not output.strip():
+                            n_degenerate += 1
                         steered_scores.append(
                             toxicity_score(output, steerer.device)
                         )
@@ -290,8 +299,9 @@ def main() -> None:
                             steerer.perplexity(output)
                         )
                     differences = base_scores - np.asarray(steered_scores)
+                    valid = differences[~np.isnan(differences)]
                     normalized_ppl = float(
-                        np.mean(steered_perplexities)
+                        np.nanmean(steered_perplexities)
                         / max(mean_base_ppl, 1e-6)
                     )
                     row = {
@@ -301,13 +311,28 @@ def main() -> None:
                         "k": k,
                         "layers": "|".join(map(str, selected_layers)),
                         "coeff": args.best_lambda,
-                        "delta": round(float(differences.mean()), 4),
+                        "delta": round(float(np.nanmean(differences)), 4)
+                        if valid.size
+                        else float("nan"),
                         "delta_std": (
-                            round(float(differences.std(ddof=1)), 4)
-                            if len(differences) > 1
+                            round(float(valid.std(ddof=1)), 4)
+                            if valid.size > 1
+                            else 0.0
+                        ),
+                        "delta_sem": (
+                            round(
+                                float(
+                                    valid.std(ddof=1) / np.sqrt(valid.size)
+                                ),
+                                4,
+                            )
+                            if valid.size > 1
                             else 0.0
                         ),
                         "norm_ppl": round(normalized_ppl, 4),
+                        "degenerate_frac": round(
+                            n_degenerate / max(len(test_prompts), 1), 4
+                        ),
                         "n": len(test_prompts),
                     }
                     append_row(results_path, row, FIELDS)

@@ -3,7 +3,11 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
-DatasetItem = str | tuple[str, str]
+# A plain prompt, or a Sycophancy item:
+# (question, sycophantic_answer, honest_answer). Both answers are kept:
+# the sycophancy metric is contrastive and cannot be computed without
+# the answer the model is supposed to prefer instead.
+DatasetItem = str | tuple[str, str, str]
 DatasetSplit = dict[str, list[DatasetItem]]
 
 
@@ -21,18 +25,34 @@ def _split(
     toxic: list[str],
     benign: list[str],
     fraction: float = 0.8,
+    val_fraction: float = 0.5,
     seed: int = 42,
 ) -> DatasetSplit:
+    """Split into train / validation / test.
+
+    The training portion is unchanged from the original 80% cut, so circuit
+    discovery is unaffected. The held-out 20% is halved into `val_prompts`
+    (used to pick the steering coefficient) and `test_prompts` (used only to
+    report), so the reported delta is not read off the same prompts the
+    coefficient was selected on. `test_benign` is the control condition:
+    steering that merely suppresses fluency moves it as much as it moves
+    `test_prompts`, while genuinely targeted steering leaves it alone.
+    """
     rng = random.Random(seed)
     indices = list(range(min(len(toxic), len(benign))))
     rng.shuffle(indices)
     toxic = [toxic[index] for index in indices]
     benign = [benign[index] for index in indices]
     cutoff = int(len(toxic) * fraction)
+    held_toxic = toxic[cutoff:]
+    held_benign = benign[cutoff:]
+    val_cutoff = int(len(held_toxic) * val_fraction)
     return {
         "train_toxic": toxic[:cutoff],
         "train_benign": benign[:cutoff],
-        "test_prompts": toxic[cutoff:],
+        "val_prompts": held_toxic[:val_cutoff],
+        "test_prompts": held_toxic[val_cutoff:],
+        "test_benign": held_benign[val_cutoff:],
     }
 
 
@@ -103,37 +123,52 @@ def load_emotion(n: int = 500, seed: int = 42) -> DatasetSplit:
 
 
 def load_sycophancy(n: int = 500, seed: int = 42) -> DatasetSplit:
-    del seed  # The source dataset has a fixed order, matching the paper notebook.
+    # The source file has a fixed order. Honouring the seed shuffles which
+    # items land in train/val/test, so repeated runs are genuinely
+    # different draws; without it every seed produces an identical split
+    # and an identical (deterministic, teacher-forced) score, leaving no
+    # seed-level variance to put a confidence interval on.
     n_each = n // 2
     n_train = int(n_each * 0.8)
-    n_test = n_each - n_train
+    n_held = n_each - n_train
+    n_val = n_held // 2
     dataset = _load_dataset(
         "Anthropic/model-written-evals",
         data_files="sycophancy/sycophancy_on_nlp_survey.jsonl",
         split="train",
     )
+    order = list(range(len(dataset)))
+    random.Random(seed).shuffle(order)
     train_toxic: list[DatasetItem] = []
     train_benign: list[DatasetItem] = []
-    test_items: list[DatasetItem] = []
-    for row in dataset:
+    held_items: list[DatasetItem] = []
+    for position in order:
+        row = dataset[position]
         question = row["question"]
         sycophantic = row["answer_matching_behavior"]
         honest = row["answer_not_matching_behavior"]
         if len(train_toxic) < n_train:
             train_toxic.append(question + sycophantic)
             train_benign.append(question + honest)
-        elif len(test_items) < n_test:
-            test_items.append((question, sycophantic))
-        if len(train_toxic) >= n_train and len(test_items) >= n_test:
+        elif len(held_items) < n_held:
+            # Both answers are kept: the score is P(sycophantic) normalised
+            # against P(honest), which needs the pair.
+            held_items.append((question, sycophantic, honest))
+        if len(train_toxic) >= n_train and len(held_items) >= n_held:
             break
     print(
         f"Sycophancy: {len(train_toxic)} train pairs, "
-        f"{len(test_items)} test"
+        f"{n_val} val, {len(held_items) - n_val} test"
     )
     return {
         "train_toxic": train_toxic,
         "train_benign": train_benign,
-        "test_prompts": test_items,
+        "val_prompts": held_items[:n_val],
+        "test_prompts": held_items[n_val:],
+        # The sycophancy score is already contrastive (it compares the two
+        # answers on the same question), so it carries its own control and
+        # needs no separate benign slice.
+        "test_benign": [],
     }
 
 

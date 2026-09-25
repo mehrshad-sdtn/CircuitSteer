@@ -27,3 +27,9 @@ wandb/
 
 # Local Colab source
 CircSteer.ipynb
+
+# Local-only material, not part of the code release
+archives/
+paper/
+*.sbatch
+HANDOFF.md
