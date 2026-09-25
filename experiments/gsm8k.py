@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 import re
+from pathlib import Path
 
 import torch
 from datasets import load_dataset
@@ -28,6 +29,7 @@ ITEM_FIELDS = [
     "base_ok",
     "steered_ok",
 ]
+BASE_FIELDS = ["model", "idx", "gold", "base_pred", "base_ok"]
 SUMMARY_FIELDS = [
     "model",
     "behavior",
@@ -135,6 +137,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gsm8k-samples", type=int, default=250)
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument(
+        "--base-cache-dir",
+        type=Path,
+        default=None,
+        help="Share unsteered answers across behaviors: the base model "
+             "does not depend on the circuit, so each item is generated "
+             "once per model and reused.",
+    )
+    parser.add_argument(
         "--instruct-models",
         nargs="*",
         default=["llama"],
@@ -217,10 +227,12 @@ def generate(
                 verbose=False,
             )
         except Exception:
+            # Stay greedy: sampling here would silently change the
+            # decoding protocol for whichever items hit the fallback.
             return model.generate(
                 input_tokens,
                 max_new_tokens=max_new_tokens,
-                temperature=1.0,
+                do_sample=False,
                 verbose=False,
             )
 
@@ -265,6 +277,14 @@ def main() -> None:
         steerer = CircuitSteer(model_key, config=config_from_args(args))
         steerer.fit(toxic, benign)
         is_instruct = model_key in args.instruct_models
+        base_path = (
+            args.base_cache_dir / f"circuitsteer_gsm8k_{model_key}_base.csv"
+            if args.base_cache_dir else None
+        )
+        base_cache = {
+            int(row["idx"]): row
+            for row in (read_rows(base_path) if base_path else [])
+        }
 
         try:
             progress = tqdm(selected, desc=f"GSM8K/{model_key}")
@@ -278,13 +298,43 @@ def main() -> None:
                     if is_instruct
                     else base_prompt(item["question"])
                 )
-                base_output = generate(
-                    steerer,
-                    prompt,
-                    0.0,
-                    is_instruct,
-                    args.max_new_tokens,
-                )
+                cached = base_cache.get(dataset_index)
+                if cached is not None:
+                    base_prediction = (
+                        float(cached["base_pred"])
+                        if cached["base_pred"] not in ("", "None") else None
+                    )
+                    base_ok = cached["base_ok"] == "True"
+                else:
+                    base_output = generate(
+                        steerer,
+                        prompt,
+                        0.0,
+                        is_instruct,
+                        args.max_new_tokens,
+                    )
+                    base_prediction = extract_answer(base_output)
+                    base_ok = (
+                        base_prediction is not None
+                        and gold is not None
+                        and abs(base_prediction - gold) < 1e-3
+                    )
+                    if base_path is not None:
+                        append_row(
+                            base_path,
+                            {
+                                "model": model_key,
+                                "idx": dataset_index,
+                                "gold": gold,
+                                "base_pred": base_prediction,
+                                "base_ok": base_ok,
+                            },
+                            BASE_FIELDS,
+                        )
+                        base_cache[dataset_index] = {
+                            "base_pred": str(base_prediction),
+                            "base_ok": str(base_ok),
+                        }
                 steered_output = generate(
                     steerer,
                     prompt,
@@ -292,13 +342,7 @@ def main() -> None:
                     is_instruct,
                     args.max_new_tokens,
                 )
-                base_prediction = extract_answer(base_output)
                 steered_prediction = extract_answer(steered_output)
-                base_ok = (
-                    base_prediction is not None
-                    and gold is not None
-                    and abs(base_prediction - gold) < 1e-3
-                )
                 steered_ok = (
                     steered_prediction is not None
                     and gold is not None
